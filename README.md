@@ -6,7 +6,7 @@ Automated job board aggregating 1,000,000+ positions from 20,000+ companies acro
 
 ## Live Site
 
-[View Job Board](https://feashliaa.github.io/job-board-aggregator)
+[View Job Board](https://riley-dorrington.github.io/job-board-aggregator/)
 
 ## Features
 
