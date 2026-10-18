@@ -76,7 +76,7 @@ data/
 4. **Chunk**: Results are split into ~25k-job gzipped chunks with a manifest file
 5. **Merge**: `merge_data.py` deduplicates against existing data and prunes jobs older than 30 days
 6. **Monitor**: A daily trend snapshot (per-platform and per-tier counts) is appended to `data/trends/daily.jsonl` and committed to main. `check_anomalies.py` compares each platform against its recent baseline and opens an issue if one drops off or spikes abnormally.
-7. **Deploy**: GitHub Actions force-pushes the regenerated chunks to the separate `job-board-data` [repo](https://github.com/Feashliaa/job-board-data) and creates a tagged release on main. The frontend fetches chunks from the data repo's GitHub Pages site, keeping the main repo code-only.
+7. **Deploy**: GitHub Actions force-pushes the regenerated chunks to the separate `job-board-data` [repo](https://github.com/Riley-Dorrington/job-board-data) and creates a tagged release on main. The frontend fetches chunks from the data repo's GitHub Pages site, keeping the main repo code-only.
 
 ## Company Discovery
 
