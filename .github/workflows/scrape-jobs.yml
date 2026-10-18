@@ -18,7 +18,7 @@ jobs:
 
       - name: Fetch existing data from data repo
         run: |
-          git clone --depth 1 https://github.com/Feashliaa/job-board-data.git prev-data
+          git clone --depth 1 https://github.com/Riley-Dorrington/job-board-data.git prev-data
           mkdir -p data/chunks
           cp -r prev-data/data/chunks/* data/chunks/ 2>/dev/null || true
           cp prev-data/data/metadata.json data/metadata.json 2>/dev/null || true
@@ -172,7 +172,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Push regenerated data to data repo
         run: |
-          git clone https://x-access-token:${DATA_REPO_TOKEN}@github.com/Feashliaa/job-board-data.git data-repo
+          git clone https://x-access-token:${DATA_REPO_TOKEN}@github.com/Riley-Dorrington/job-board-data.git data-repo
           cd data-repo
           git checkout --orphan fresh
           git rm -rf . > /dev/null 2>&1 || true
