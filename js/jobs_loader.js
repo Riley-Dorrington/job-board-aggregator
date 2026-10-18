@@ -28,7 +28,7 @@ export async function fetchAndDecompress(url) {
  * @param {string} url - Path to the .json.gz file
  * @returns {Promise<Array>} Parsed JSON array
  */
-export async function loadJobsProgressive(app, basePath = 'https://feashliaa.github.io/job-board-data/data/chunks') {
+export async function loadJobsProgressive(app, basePath = 'https://riley-dorrington.github.io/job-board-data/data/chunks') {
     document.querySelector('.job-table thead')?.classList.add('sorting-locked');
 
     const base_url = basePath;
