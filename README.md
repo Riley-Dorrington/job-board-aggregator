@@ -85,7 +85,7 @@ Company lists are built from Common Crawl index data using a separate harvesting
 ## Local Development
 
 ```bash
-git clone https://github.com/Feashliaa/job-board-aggregator.git
+git clone https://github.com/riley-dorrington/job-board-aggregator.git
 cd job-board-aggregator
 python -m http.server 8000
 # Visit http://localhost:8000
