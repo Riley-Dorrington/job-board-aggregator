@@ -2,7 +2,7 @@
 
 ![Job Board Aggregator - table view with salary and ATS data](docs/screenshot-table.png)
 
-Automated job board aggregating 1,000,000+ positions from 20,000+ companies across seven major ATS platforms. Updated daily via GitHub Actions.
+Automated job board aggregating 1,000,000+ positions from 20,000+ companies across eight major ATS platforms. Updated daily via GitHub Actions.
 
 ## Live Site
 
@@ -10,7 +10,7 @@ Automated job board aggregating 1,000,000+ positions from 20,000+ companies acro
 
 ## Features
 
-- **Multi-platform scraping**: Greenhouse, Lever, Ashby, BambooHR, iCIMs, Paylocity, and Workday APIs scraped in parallel using `concurrent.futures`
+- **Multi-platform scraping**: Greenhouse, Lever, Ashby, BambooHR, iCIMs, Paylocity, Workday, and Join APIs scraped in parallel using `concurrent.futures`
 - **Progressive loading**: Chunked gzip data loaded via Web Workers for fast initial render
 - **Advanced filtering**: Filter by title, company, location, ATS platform, experience level, and exclude keywords. Toggle remote-only, hide recruiter postings, or hide already-applied jobs
 - **Job tier classification**: Automatic skill-level tagging (intern/entry/mid/senior) using weighted keyword scoring on job titles
@@ -58,6 +58,7 @@ js/
 data/
 ├── *_companies.json    # Company lists per ATS platform (tracked on main)
 ├── salary/             # Salary lookup table, sharded a-z (static input)
+├── join_company_ids.json # Join slug → company id cache, updated by each run (tracked on main)
 ├── locations.json      # Geolocation lookup
 └── trends/daily.jsonl  # Append-only daily trend history (one JSON object per line)
 
@@ -70,7 +71,7 @@ data/
 
 ## Data Pipeline
 
-1. **Scrape**: `scraper.py` fetches jobs from all seven ATS APIs concurrently. Worker counts are tuned per platform to respect each one's rate limits: 50 for Workday, 30 for Greenhouse/Lever/iCIMs, 10 for BambooHR, and 5 for Ashby/Paylocity (the tightest limiters).
+1. **Scrape**: `scraper.py` fetches jobs from all eight ATS APIs concurrently. Worker counts are tuned per platform to respect each one's rate limits: 50 for Workday, 30 for Greenhouse/Lever/iCIMs, 10 for BambooHR, and 5 for Ashby/Paylocity (the tightest limiters). Join uses 4 workers behind one shared limiter of 10 requests per second, because Join rate-limits all clients together.
 2. **Classify**: Each job is tagged with a skill level based on title keywords and flagged if posted by a recruiting agency
 3. **Clean**: Jobs missing titles, URLs, or company info are dropped
 4. **Chunk**: Results are split into ~25k-job gzipped chunks with a manifest file
@@ -81,6 +82,8 @@ data/
 ## Company Discovery
 
 Company lists are built from Common Crawl index data using a separate harvesting pipeline. The harvester scans CDX archives for URLs matching 20+ ATS domain patterns, extracts company slugs via regex, and deduplicates across multiple crawl snapshots. This currently yields give or take 95,000 unique company identifiers.
+
+Join is the exception: it publishes its own company directory (`https://join.com/companies/sitemap.xml`), so its company list is read fresh on every run. `data/join_company_ids.json` only keeps the numeric company id of each company, which the jobs API needs and only the careers page shows.
 
 ## Local Development
 

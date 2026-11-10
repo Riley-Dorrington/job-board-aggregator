@@ -527,6 +527,11 @@ thead.sorting-locked th,
     color: #b03a2e;
 }
 
+.badge.ats-join {
+    background: #e0e7ff;
+    color: #3730a3;
+}
+
 .badge.ats-unknown {
     background: #f1f5f9;
     color: #64748b;
