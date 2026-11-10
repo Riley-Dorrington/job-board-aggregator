@@ -2,7 +2,7 @@
 
 ![Job Board Aggregator - table view with salary and ATS data](docs/screenshot-table.png)
 
-Automated job board aggregating 1,000,000+ positions from 20,000+ companies across seven major ATS platforms. Updated daily via GitHub Actions.
+Automated job board aggregating 1,000,000+ positions from 20,000+ companies across eight major ATS platforms. Updated daily via GitHub Actions.
 
 ## Live Site
 
@@ -10,7 +10,7 @@ Automated job board aggregating 1,000,000+ positions from 20,000+ companies acro
 
 ## Features
 
-- **Multi-platform scraping**: Greenhouse, Lever, Ashby, BambooHR, iCIMs, Paylocity, and Workday APIs scraped in parallel using `concurrent.futures`
+- **Multi-platform scraping**: Greenhouse, Lever, Ashby, BambooHR, iCIMs, Paylocity, and Workday APIs scraped in parallel using `concurrent.futures`, plus Workable's public XML feed of all its customers' postings
 - **Progressive loading**: Chunked gzip data loaded via Web Workers for fast initial render
 - **Advanced filtering**: Filter by title, company, location, ATS platform, experience level, and exclude keywords. Toggle remote-only, hide recruiter postings, or hide already-applied jobs
 - **Job tier classification**: Automatic skill-level tagging (intern/entry/mid/senior) using weighted keyword scoring on job titles
@@ -70,7 +70,7 @@ data/
 
 ## Data Pipeline
 
-1. **Scrape**: `scraper.py` fetches jobs from all seven ATS APIs concurrently. Worker counts are tuned per platform to respect each one's rate limits: 50 for Workday, 30 for Greenhouse/Lever/iCIMs, 10 for BambooHR, and 5 for Ashby/Paylocity (the tightest limiters).
+1. **Scrape**: `scraper.py` fetches jobs from all eight ATS platforms concurrently. Worker counts are tuned per platform to respect each one's rate limits: 50 for Workday, 30 for Greenhouse/Lever/iCIMs, 10 for BambooHR, and 5 for Ashby/Paylocity (the tightest limiters). Workable needs no company list and no workers: one download of its hourly XML feed (`workable.xml`) carries the postings of every Workable customer, and it is parsed as a stream.
 2. **Classify**: Each job is tagged with a skill level based on title keywords and flagged if posted by a recruiting agency
 3. **Clean**: Jobs missing titles, URLs, or company info are dropped
 4. **Chunk**: Results are split into ~25k-job gzipped chunks with a manifest file

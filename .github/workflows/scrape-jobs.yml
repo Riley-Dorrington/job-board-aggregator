@@ -52,6 +52,7 @@ jobs:
           WORKDAY=$(jq '[.[] | select(.ats == "Workday")] | length' scripts/output/all_jobs.json)
           ICIMS=$(jq '[.[] | select(.ats == "iCIMS")] | length' scripts/output/all_jobs.json)
           PAYLOCITY=$(jq '[.[] | select(.ats == "Paylocity")] | length' scripts/output/all_jobs.json)
+          WORKABLE=$(jq '[.[] | select(.ats == "Workable")] | length' scripts/output/all_jobs.json)
 
           # Tier breakdown
           INTERN=$(jq '[.[] | select(.skill_level == "intern")] | length' scripts/output/all_jobs.json)
@@ -76,6 +77,7 @@ jobs:
             --argjson workday "$WORKDAY" \
             --argjson icims "$ICIMS" \
             --argjson paylocity "$PAYLOCITY" \
+            --argjson workable "$WORKABLE" \
             --argjson intern "$INTERN" \
             --argjson entry "$ENTRY" \
             --argjson mid "$MID" \
@@ -92,7 +94,8 @@ jobs:
                 lever: $lever,
                 workday: $workday,
                 icims: $icims,
-                paylocity: $paylocity
+                paylocity: $paylocity,
+                workable: $workable
               },
               by_tier: {
                 intern: $intern,
