@@ -37,6 +37,7 @@ export function createColumns() {
                     'bamboohr': 'ats-bamboohr',
                     'workable': 'ats-workable',
                     'paylocity': 'ats-paylocity',
+                    'join': 'ats-join',
                 };
                 const cls = classes[ats.toLowerCase()] || 'ats-unknown';
                 return `<span class="badge ${cls}">${escape(ats)}</span>`;

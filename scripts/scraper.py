@@ -897,6 +897,408 @@ def fetch_company_jobs_paylocity(slug):
     return slug, [], None
 
 
+# ============================================================
+# JOIN (company list from Join's own sitemap)
+# ============================================================
+#
+# Join publishes its company directory:
+#   https://join.com/companies/sitemap.xml  (listed in robots.txt)
+# so the company list is read fresh on every run, not from a file.
+#
+# The jobs come from the public GraphQL endpoint that the careers page itself
+# calls (query publicJobs). It needs the numeric company id, which only the
+# careers page shows (__NEXT_DATA__). The id does not change, so it is kept in
+# JOIN_FILE and read again only for companies that are new in the sitemap. A
+# failed lookup is not stored and is tried again on the next run. Companies
+# that left the sitemap are dropped from it. The company name comes with the
+# jobs, so it is always current.
+#
+# JOIN_FILE is a JSON array with one {"slug", "id"} object per line, sorted by
+# slug, so a daily diff shows only the companies that came or went.
+#
+# The GraphQL endpoint rate-limits all clients together: about 100 requests in
+# a burst, then every request is refused for a few seconds; about ten requests
+# a second hold. A refusal is an HTTP 200 with a GraphQL error whose
+# extensions.code is TOO_MANY_REQUESTS. All join.com requests (sitemap,
+# careers pages, GraphQL) go through one shared limiter, and a refusal pauses
+# every worker, not only the one that got it.
+
+JOIN_FILE = os.path.join(ROOT_DIR, "data", "join_company_ids.json")
+JOIN_SITEMAP_URL = "https://join.com/companies/sitemap.xml"
+JOIN_GRAPHQL_URL = "https://join.com/candidate-api/graphql"
+JOIN_WORKERS = 4
+JOIN_REQUESTS_PER_SECOND = 10
+# Backoff after a refusal: 2, 4, 8, 16, 16 seconds. It outlasts the refusal
+# window even when several workers wait on it at once.
+JOIN_RETRIES = 5
+JOIN_BACKOFF_BASE = 2.0
+JOIN_BACKOFF_MAX = 16.0
+# The server caps pageSize at 100.
+JOIN_PAGE_SIZE = 100
+# Safety cap on pagination, whatever pageInfo.pageCount says.
+JOIN_MAX_PAGES = 50
+JOIN_RATE_LIMIT_CODE = "TOO_MANY_REQUESTS"
+
+JOIN_PUBLIC_JOBS_QUERY = """query PublicJobsList($input: PublicJobsQueryInput!) {
+  publicJobs(input: $input) {
+    items {
+      id
+      title
+      createdAt
+      workplaceType
+      remoteType
+      remoteRegion { name }
+      city { cityName countryName }
+      country { name }
+      company { name }
+    }
+    pageInfo { pageCount }
+  }
+}"""
+
+_JOIN_SLUG_RE = re.compile(r"^https://join\.com/companies/([^/?#]+)/?$")
+_JOIN_NEXT_DATA_RE = re.compile(
+    r"<script[^>]+__NEXT_DATA__[^>]*>([\s\S]*?)</script>"
+)
+_JOIN_URLSET_RE = re.compile(r"<urlset\b[^>]*/>|<urlset\b[^>]*>[\s\S]*</urlset\s*>")
+_JOIN_LOC_RE = re.compile(r"<loc>\s*([^<]+?)\s*</loc>")
+_JOIN_WORKPLACE = {"ONSITE": "On-site", "HYBRID": "Hybrid", "REMOTE": "Remote"}
+
+
+class JoinRateLimitError(Exception):
+    """join.com still refused after every retry."""
+
+
+class _RateLimiter:
+    """Spaces requests from all threads to at most `per_second`, and lets one
+    refusal pause every thread."""
+
+    def __init__(self, per_second, clock=time.monotonic, sleep=time.sleep):
+        self.interval = 1.0 / per_second
+        self.clock = clock
+        self.sleep = sleep
+        self.lock = threading.Lock()
+        self.next_at = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = self.clock()
+            slot = max(now, self.next_at)
+            self.next_at = slot + self.interval
+        if slot > now:
+            self.sleep(slot - now)
+
+    def pause(self, seconds):
+        with self.lock:
+            self.next_at = max(self.next_at, self.clock() + seconds)
+
+
+def _join_is_rate_limited(response):
+    if response.status_code == 429:
+        return True
+    if response.status_code != 200 or "json" not in response.headers.get("Content-Type", ""):
+        return False
+    try:
+        errors = response.json().get("errors") or []
+    except ValueError:
+        return False
+    for e in errors:
+        code = ((e or {}).get("extensions") or {}).get("code")
+        if code == JOIN_RATE_LIMIT_CODE or "too many requests" in str((e or {}).get("message", "")).lower():
+            return True
+    return False
+
+
+class JoinClient:
+    """All join.com requests, through one shared limiter with backoff."""
+
+    def __init__(self, session=None, limiter=None, sleep=time.sleep):
+        self.session = session or requests.Session()
+        self.limiter = limiter or _RateLimiter(JOIN_REQUESTS_PER_SECOND)
+        self.sleep = sleep
+
+    def request(self, method, url, **kwargs):
+        """Returns the response; raises JoinRateLimitError when every retry was
+        refused, and requests exceptions on network errors after the retries."""
+        kwargs.setdefault("timeout", 30)
+        # Every URL is a fixed https://join.com one; a redirect is not followed.
+        kwargs.setdefault("allow_redirects", False)
+        headers = {"User-Agent": random.choice(USER_AGENTS), **kwargs.pop("headers", {})}
+        for attempt in range(JOIN_RETRIES + 1):
+            self.limiter.wait()
+            try:
+                response = self.session.request(method, url, headers=headers, **kwargs)
+            except requests.RequestException:
+                if attempt == JOIN_RETRIES:
+                    raise
+                self.sleep(min(JOIN_BACKOFF_BASE * 2**attempt, JOIN_BACKOFF_MAX))
+                continue
+            retryable = _join_is_rate_limited(response) or response.status_code in (502, 503, 504)
+            if not retryable:
+                return response
+            if attempt == JOIN_RETRIES:
+                if response.status_code in (502, 503, 504):
+                    return response
+                raise JoinRateLimitError(f"join.com: still refused after {JOIN_RETRIES} retries ({url})")
+            self.limiter.pause(min(JOIN_BACKOFF_BASE * 2**attempt, JOIN_BACKOFF_MAX))
+        raise AssertionError("unreachable")
+
+
+def parse_join_sitemap(xml):
+    """Company slugs from Join's company sitemap, in document order, each
+    once. Only https://join.com/companies/<slug> counts; deeper paths and other
+    hosts are skipped. An empty <urlset> is an empty list. Raises ValueError
+    for a sitemap cut short (no complete <urlset>) and for one with entries of
+    which none is a company page, so the caller keeps its last good list."""
+    if not isinstance(xml, str) or not _JOIN_URLSET_RE.search(xml):
+        raise ValueError("join: company sitemap has no complete <urlset> element")
+    slugs = {}
+    locs = 0
+    for raw in _JOIN_LOC_RE.findall(xml):
+        locs += 1
+        m = _JOIN_SLUG_RE.match(html.unescape(raw))
+        if m:
+            slugs.setdefault(m.group(1), None)
+    urls = len(re.findall(r"<url\b", xml))
+    if (urls or locs) and not slugs:
+        raise ValueError(
+            f"join: company sitemap has {urls} <url> and {locs} <loc> entries but no company page"
+        )
+    return list(slugs)
+
+
+def parse_join_company_id(page_html):
+    """The company id from a careers page's __NEXT_DATA__, in either frontend
+    shape (props.pageProps.pageData, or initialState on older cached pages).
+    None when the page has no integer company id."""
+    m = _JOIN_NEXT_DATA_RE.search(page_html or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    page_props = (data.get("props") or {}).get("pageProps") or {}
+    company = ((page_props.get("pageData") or page_props.get("initialState")) or {}).get("company") or {}
+    cid = company.get("id")
+    return cid if _is_join_id(cid) else None
+
+
+def _is_join_id(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def load_join_cache(path=JOIN_FILE):
+    """slug -> company id from JOIN_FILE; empty when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+    cache = {}
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and isinstance(r.get("slug"), str) and _is_join_id(r.get("id")):
+            cache[r["slug"]] = r["id"]
+    return cache
+
+
+def save_join_cache(cache, path=JOIN_FILE):
+    """Write JOIN_FILE: a JSON array, one object per line, sorted by slug."""
+    lines = [
+        json.dumps({"slug": slug, "id": cid}, ensure_ascii=False)
+        for slug, cid in sorted(cache.items())
+    ]
+    text = "[\n" + ",\n".join(lines) + ("\n" if lines else "") + "]\n"
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def join_company_lookup(client, slug):
+    """The company id from the careers page, or None when it cannot be read."""
+    try:
+        response = client.request("GET", f"https://join.com/companies/{slug}")
+    except (requests.RequestException, JoinRateLimitError):
+        return None
+    if response.status_code != 200:
+        return None
+    return parse_join_company_id(response.text)
+
+
+def format_join_location(job):
+    """Location text as the careers page labels it. A remote posting shows only
+    the area it is open to: its city is the company's default city."""
+    city = ((job.get("city") or {}).get("cityName") or "").strip()
+    country = (
+        ((job.get("country") or {}).get("name") or "").strip()
+        or ((job.get("city") or {}).get("countryName") or "").strip()
+    )
+    workplace = job.get("workplaceType")
+    if workplace == "REMOTE":
+        region = ((job.get("remoteRegion") or {}).get("name") or "").strip()
+        remote_type = job.get("remoteType")
+        area = "worldwide" if remote_type == "ANYWHERE" else region if remote_type == "REGION" else country
+        return f"Remote ({area})" if area else "Remote"
+    place = ", ".join(p for p in (city, country) if p)
+    if workplace == "HYBRID":
+        return f"{place} (hybrid)" if place else "Hybrid"
+    return place or "Not specified"
+
+
+def fetch_join_company_jobs(client, slug, company_id):
+    """All jobs of one company. Raises when a page fails or the response has an
+    unexpected shape: a partial list would read as postings that closed."""
+    items = []
+    page_count = 1
+    page = 1
+    while page <= min(page_count, JOIN_MAX_PAGES):
+        response = client.request(
+            "POST",
+            JOIN_GRAPHQL_URL,
+            json={
+                "operationName": "PublicJobsList",
+                "query": JOIN_PUBLIC_JOBS_QUERY,
+                "variables": {
+                    "input": {
+                        "companyId": company_id,
+                        "paginationPage": {"page": page, "pageSize": JOIN_PAGE_SIZE},
+                        "filters": {},
+                    }
+                },
+            },
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            raise ValueError(f"join: publicJobs HTTP {response.status_code}")
+        data = response.json()
+        if data.get("errors"):
+            raise ValueError(f"join: publicJobs failed: {data['errors'][0].get('message')}")
+        public_jobs = (data.get("data") or {}).get("publicJobs") or {}
+        page_items = public_jobs.get("items")
+        if not isinstance(page_items, list):
+            raise ValueError("join: publicJobs response has no items array")
+        count = (public_jobs.get("pageInfo") or {}).get("pageCount")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"join: publicJobs response has no valid pageCount ({count!r})")
+        if page_items and count < page:
+            raise ValueError(f"join: page {page} has jobs but pageCount is {count}")
+        items.extend(page_items)
+        page_count = count
+        page += 1
+
+    names = [((j.get("company") or {}).get("name") or "").strip() for j in items]
+    company = next((n for n in names if n), slug)
+    jobs = []
+    for j in items:
+        jid = j.get("id")
+        title = (j.get("title") or "").strip() if isinstance(j.get("title"), str) else ""
+        if not isinstance(jid, int) or isinstance(jid, bool) or not title:
+            continue
+        workplace = j.get("workplaceType")
+        location = format_join_location(j)
+        if workplace == "REMOTE":
+            remote, coords = True, None
+        else:
+            remote, coords = enrich_location(location.replace(" (hybrid)", ""))
+        # /companies/<slug>/<id>: the job id stays the same for the posting's
+        # whole life; Join redirects it to the current page of the posting.
+        url = f"https://join.com/companies/{slug}/{jid}"
+        job = {
+            "company": company,
+            "company_slug": slug,
+            "title": title,
+            "location": location[:50],
+            "remote": remote,
+            "coords": coords,
+            "url": url,
+            "absolute_url": url,
+            "id": jid,
+            "updated_at": j.get("createdAt"),
+            "is_recruiter": is_recruiter_company(company),
+            "ats": "Join",
+            "skill_level": job_tier_classification(title),
+            **get_job_metadata(),
+        }
+        if workplace in _JOIN_WORKPLACE:
+            job["workplaceType"] = _JOIN_WORKPLACE[workplace]
+        jobs.append(job)
+    return jobs
+
+
+def fetch_join_jobs(client=None, cache_path=JOIN_FILE, workers=JOIN_WORKERS):
+    """Read the sitemap, update JOIN_FILE, then fetch every company's jobs.
+    Returns (active_companies, jobs) like fetch_all_jobs."""
+    print("=" * 80)
+    print("FETCHING JOBS FROM PLATFORM: JOIN")
+    print("=" * 80 + "\n")
+    client = client or JoinClient()
+    cache = load_join_cache(cache_path)
+
+    try:
+        response = client.request("GET", JOIN_SITEMAP_URL)
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+        slugs = parse_join_sitemap(response.text)
+        sitemap_ok = True
+    except Exception as e:
+        # Keep the last good list: the companies already in JOIN_FILE.
+        print(f"  join sitemap unavailable ({e}); using the {len(cache):,} cached companies")
+        slugs = sorted(cache)
+        sitemap_ok = False
+
+    new = [s for s in slugs if s not in cache]
+    failed_lookups = 0
+    if new:
+        print(f"  Looking up {len(new):,} new companies")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for slug, cid in zip(new, executor.map(lambda s: join_company_lookup(client, s), new)):
+                if cid:
+                    cache[slug] = cid
+                else:
+                    failed_lookups += 1
+
+    if sitemap_ok:
+        listed = set(slugs)
+        cache = {s: v for s, v in cache.items() if s in listed}
+    try:
+        save_join_cache(cache, cache_path)
+    except OSError as e:
+        print(f"  Could not save {cache_path}: {e}")
+
+    def run(slug):
+        try:
+            return slug, fetch_join_company_jobs(client, slug, cache[slug])
+        except Exception as e:
+            print(f"  Error fetching Join for {slug}: {e}")
+            return slug, None
+
+    targets = [s for s in slugs if s in cache]
+    active_companies = {}
+    all_jobs = []
+    failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for i, (slug, jobs) in enumerate(executor.map(run, targets), 1):
+            if jobs is None:
+                failed += 1
+            elif jobs:
+                all_jobs.extend(jobs)
+                active_companies[slug] = len(jobs)
+            if i % 500 == 0:
+                print(f"  [{i}/{len(targets)}] Checked...")
+
+    print("\nDETAILED STATS FOR JOIN:")
+    print(f"  Companies in sitemap: {len(slugs):,}" + ("" if sitemap_ok else " (cached list)"))
+    print(f"  New lookups failed (retried next run): {failed_lookups:,}")
+    print(f"  Companies checked: {len(targets):,}")
+    print(f"  Companies with jobs: {len(active_companies):,}")
+    print(f"  Failed: {failed:,}")
+    print(f"  Total jobs: {len(all_jobs):,}")
+    return active_companies, all_jobs
+
+
 def fetch_all_jobs(companies, fetcher, platform="ATS"):
     """Fetch jobs from all companies in parallel."""
     print("=" * 80)
@@ -1217,7 +1619,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_jobs": len(all_jobs),
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
-        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, icims_sitemap, paylocity_scrape, workable_feed",
+        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, icims_sitemap, paylocity_scrape, workable_feed, join_graphql",
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -1270,20 +1672,25 @@ def main():
     all_active_companies = {}
     all_jobs = []
     workable_companies = set()
+    join_companies = set()
 
     # Workable has no company list: one feed carries every company's postings.
-    with ThreadPoolExecutor(max_workers=len(platforms) + 1) as platform_executor:
+    # Join reads its company list from Join's sitemap, not from a file.
+    with ThreadPoolExecutor(max_workers=len(platforms) + 2) as platform_executor:
         futures = {
             platform_executor.submit(fetch_all_jobs, companies, fetcher, name): name
             for companies, fetcher, name in platforms
         }
         futures[platform_executor.submit(fetch_workable_jobs)] = "WORKABLE"
+        futures[platform_executor.submit(fetch_join_jobs)] = "JOIN"
 
         for future in as_completed(futures):
             name = futures[future]
             active, jobs = future.result()
             if name == "WORKABLE":
                 workable_companies = set(active)
+            if name == "JOIN":
+                join_companies = set(active)
             all_active_companies.update(active)
             all_jobs.extend(jobs)
             print(
@@ -1300,6 +1707,7 @@ def main():
         | icims_companies
         | paylocity_companies
         | workable_companies
+        | join_companies
     )
 
     save_results(all_companies, all_active_companies, all_jobs)

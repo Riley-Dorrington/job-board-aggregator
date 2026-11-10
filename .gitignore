@@ -70,6 +70,7 @@ data/metadata.json
 !data/lever_companies.json
 !data/icims_companies.json
 !data/paylocity_companies_clean.json
+!data/join_company_ids.json
 !data/locations.json
 !data/salary/salary_lookup.json
 !data/salary/shards/salary_*.json
