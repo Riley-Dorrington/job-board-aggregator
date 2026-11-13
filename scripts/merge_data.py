@@ -22,6 +22,13 @@ def get_dedup_key(job):
             return f"paylocity:{jid}"
         # no job_id: key on company+title so they don't collapse to one listing URL
         return f"paylocity:{job.get('company','')}:{job.get('title','')}"
+    if ats == "Join":
+        # https://join.com/companies/<slug>/<job id>: the chunks carry no "id"
+        # field, so the id is read from the URL. It stays the same for the
+        # posting's whole life, also when the company slug changes.
+        match = re.search(r'/companies/[^/]+/(\d+)$', url)
+        if match:
+            return f"join:{match.group(1)}"
     return url
 
 

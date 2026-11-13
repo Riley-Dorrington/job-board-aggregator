@@ -53,6 +53,7 @@ jobs:
           ICIMS=$(jq '[.[] | select(.ats == "iCIMS")] | length' scripts/output/all_jobs.json)
           PAYLOCITY=$(jq '[.[] | select(.ats == "Paylocity")] | length' scripts/output/all_jobs.json)
           WORKABLE=$(jq '[.[] | select(.ats == "Workable")] | length' scripts/output/all_jobs.json)
+          JOIN=$(jq '[.[] | select(.ats == "Join")] | length' scripts/output/all_jobs.json)
 
           # Tier breakdown
           INTERN=$(jq '[.[] | select(.skill_level == "intern")] | length' scripts/output/all_jobs.json)
@@ -78,6 +79,7 @@ jobs:
             --argjson icims "$ICIMS" \
             --argjson paylocity "$PAYLOCITY" \
             --argjson workable "$WORKABLE" \
+            --argjson join "$JOIN" \
             --argjson intern "$INTERN" \
             --argjson entry "$ENTRY" \
             --argjson mid "$MID" \
@@ -95,7 +97,8 @@ jobs:
                 workday: $workday,
                 icims: $icims,
                 paylocity: $paylocity,
-                workable: $workable
+                workable: $workable,
+                join: $join
               },
               by_tier: {
                 intern: $intern,
@@ -151,11 +154,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Trend history is append-only and tiny; it stays tracked on main.
+      # The Join company id cache is kept on main the same way.
       - name: Commit trend history to main
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add data/trends/daily.jsonl
+          git add data/trends/daily.jsonl data/join_company_ids.json
           git diff --staged --quiet || git commit -m "Trend snapshot $(date +'%Y-%m-%d')"
           git pull --rebase --autostash origin main
           git push origin main
