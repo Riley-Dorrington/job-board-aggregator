@@ -2,8 +2,15 @@ import requests, threading, json, random, time, re, os, gzip, argparse, html
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.utils import parsedate_to_datetime
 from urllib.parse import unquote
-from geolocation import build_lookup, lookup_location
+from geolocation import (
+    build_lookup,
+    lookup_location,
+    normalize,
+    COUNTRY_ALIASES,
+    CITY_ALIASES,
+)
 from requests.adapters import HTTPAdapter
 
 # ============================================================
@@ -605,7 +612,197 @@ def fetch_company_jobs_icims(slug):
         return slug, [], None
 
 
-# TODO - Add Workable
+# ============================================================
+# WORKABLE (public XML feed, no company list)
+# ============================================================
+#
+# Workable publishes one XML feed with the postings of all its customers:
+#   https://www.workable.com/boards/workable.xml
+#   <source><job><title/><date/><referencenumber/><url/><company/><city/>
+#     <state/><country/><remote/><description/>...<category/><website/></job>
+#   ...</source>
+# It is rebuilt every hour and documented for job boards:
+#   https://help.workable.com/hc/en-us/articles/4420464031767
+# So Workable needs no company list: the feed itself says which companies have
+# postings today.
+#
+# The feed is large (about 870 MB of XML, served as gzip), so it is parsed as a
+# stream with iterparse, one <job> at a time. Workable answers a second full
+# download within one hour with HTTP 429, so it is fetched once per run.
+#
+# A posting with several locations has one <job> per location, all with the
+# same <url>. These rows are folded into one job. Workable asks that the <url>
+# values are not changed, because it uses them to attribute candidates.
+
+WORKABLE_FEED_URL = "https://www.workable.com/boards/workable.xml"
+# (connect, read) timeouts; the read timeout applies between received chunks.
+WORKABLE_TIMEOUT = (30, 300)
+
+# ISO 3166 code -> English name, from the full names in geolocation.py, so a
+# country in the location text reads the same as for the other platforms.
+# A code with no entry stays a bare code in the text.
+WORKABLE_COUNTRY_NAMES = {}
+for _alias, _code in COUNTRY_ALIASES.items():
+    if _code not in WORKABLE_COUNTRY_NAMES and len(_alias) > 3 and "." not in _alias:
+        WORKABLE_COUNTRY_NAMES[_code] = _alias.title()
+
+
+def _workable_parse_date(text):
+    """Feed date ('Wed, 28 Jul 2021 10:24:17 UTC') -> ISO 8601, or None."""
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _workable_coords(city, state, country):
+    """Coordinates from the feed's own city/state/country fields. The country is
+    an ISO code, which locations.json uses too, so no free-text parsing is needed
+    (and a code such as DE or CA cannot be read as a US state)."""
+    if not city or not country:
+        return None
+    c = normalize(city)
+    c = CITY_ALIASES.get(c, c)
+    if state:
+        coords = LOCATION_MAPS["city_admin_country"].get(f"{c}|{normalize(state)}|{country}")
+        if coords:
+            return coords
+    return LOCATION_MAPS["city_country"].get(f"{c}|{country}")
+
+
+def _workable_location(row):
+    """Location text of one feed row: 'City, State, Country'."""
+    country = WORKABLE_COUNTRY_NAMES.get(row["country"], row["country"])
+    parts = []
+    for p in (row["city"], row["state"], country):
+        if p and p not in parts:
+            parts.append(p)
+    text = ", ".join(parts)
+    if row["remote"] and not row["city"]:
+        text = f"Remote, {text}" if text else "Remote"
+    return text or "Not specified"
+
+
+def parse_workable_feed(stream):
+    """Parse the Workable XML feed from a binary stream.
+
+    Returns (active_companies, jobs) like fetch_all_jobs: one job per posting
+    URL, and the number of postings for each company. Raises
+    xml.etree.ElementTree.ParseError when the document is cut short or not XML,
+    so a partial feed is never returned.
+    """
+    rows_by_url = {}
+    root = None
+    for event, elem in ET.iterparse(stream, events=("start", "end")):
+        if event == "start":
+            if root is None:
+                if elem.tag != "source":
+                    raise ET.ParseError(f"unexpected root element <{elem.tag}>")
+                root = elem
+            continue
+        if elem.tag != "job":
+            continue
+        f = {child.tag: (child.text or "").strip() for child in elem}
+        # Free the parsed element: the document is too large to keep in memory.
+        elem.clear()
+        root.remove(elem)
+
+        url = f.get("url", "")
+        title = f.get("title")
+        company = f.get("company")
+        # The site renders url as a link: keep https links only.
+        if not url.startswith("https://") or not title or not company:
+            continue
+        rows_by_url.setdefault(url, []).append(
+            {
+                "title": title,
+                "company": company,
+                "date": _workable_parse_date(f.get("date")),
+                "id": f.get("referencenumber") or None,
+                "city": f.get("city", ""),
+                "state": f.get("state", ""),
+                "country": f.get("country", "").upper(),
+                "remote": f.get("remote", "").lower() == "true",
+            }
+        )
+
+    active_companies = {}
+    jobs = []
+    for url, rows in rows_by_url.items():
+        # Oldest row first: a posting's date is the date it was first published.
+        rows.sort(key=lambda r: r["date"] or "9999")
+        first = rows[0]
+        location = _workable_location(first)
+        if len(rows) > 1:
+            # Cut the first location, not the count, to the 50-character limit.
+            more = f" (+{len(rows) - 1} more)"
+            location = location[: 50 - len(more)] + more
+        remote = any(r["remote"] for r in rows)
+        company = first["company"]
+        job = {
+            "company": company,
+            "company_slug": company,
+            "title": first["title"],
+            "location": location[:50],
+            "remote": remote,
+            "coords": _workable_coords(first["city"], first["state"], first["country"]),
+            "url": url,
+            "absolute_url": url,
+            "id": first["id"],
+            "updated_at": first["date"],
+            "is_recruiter": is_recruiter_company(company),
+            "ats": "Workable",
+            "skill_level": job_tier_classification(first["title"]),
+            **get_job_metadata(),
+        }
+        if remote:
+            job["workplaceType"] = "Remote"
+        jobs.append(job)
+        active_companies[company] = active_companies.get(company, 0) + 1
+
+    return active_companies, jobs
+
+
+def fetch_workable_jobs():
+    """Download and parse the Workable feed. On any failure returns no jobs,
+    never a partial feed; merge_data.py keeps the jobs of earlier runs."""
+    print("=" * 80)
+    print(f"FETCHING JOBS FROM PLATFORM: WORKABLE ({WORKABLE_FEED_URL})")
+    print("=" * 80 + "\n")
+    try:
+        with requests.get(
+            WORKABLE_FEED_URL,
+            headers={"User-Agent": random.choice(USER_AGENTS)},
+            stream=True,
+            timeout=WORKABLE_TIMEOUT,
+            # The feed is served directly; a redirect is not the feed.
+            allow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                retry = response.headers.get("Retry-After")
+                print(
+                    f"  Workable feed: HTTP {response.status_code}"
+                    + (f" (Retry-After: {retry}s)" if retry else "")
+                )
+                return {}, []
+            # Let urllib3 undo the gzip content encoding while streaming.
+            response.raw.decode_content = True
+            active_companies, jobs = parse_workable_feed(response.raw)
+    except Exception as e:
+        # Reading response.raw raises urllib3 errors, not requests ones, when the
+        # body is cut short; a ParseError means the XML ended early.
+        print(f"  Error fetching Workable feed: {e}")
+        return {}, []
+
+    print("\nDETAILED STATS FOR WORKABLE:")
+    print(f"  Companies with jobs: {len(active_companies)}")
+    print(f"  Total jobs: {len(jobs)}")
+    return active_companies, jobs
 
 
 def _paylocity_location(j):
@@ -1020,7 +1217,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_jobs": len(all_jobs),
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
-        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, icims_sitemap, paylocity_scrape",
+        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, icims_sitemap, paylocity_scrape, workable_feed",
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -1072,16 +1269,21 @@ def main():
     # Run all platforms concurrently
     all_active_companies = {}
     all_jobs = []
+    workable_companies = set()
 
-    with ThreadPoolExecutor(max_workers=len(platforms)) as platform_executor:
+    # Workable has no company list: one feed carries every company's postings.
+    with ThreadPoolExecutor(max_workers=len(platforms) + 1) as platform_executor:
         futures = {
             platform_executor.submit(fetch_all_jobs, companies, fetcher, name): name
             for companies, fetcher, name in platforms
         }
+        futures[platform_executor.submit(fetch_workable_jobs)] = "WORKABLE"
 
         for future in as_completed(futures):
             name = futures[future]
             active, jobs = future.result()
+            if name == "WORKABLE":
+                workable_companies = set(active)
             all_active_companies.update(active)
             all_jobs.extend(jobs)
             print(
@@ -1097,6 +1299,7 @@ def main():
         | workday_companies
         | icims_companies
         | paylocity_companies
+        | workable_companies
     )
 
     save_results(all_companies, all_active_companies, all_jobs)
