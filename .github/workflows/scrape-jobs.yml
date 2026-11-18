@@ -164,19 +164,6 @@ jobs:
           git pull --rebase --autostash origin main
           git push origin main
 
-      - name: Check for platform anomalies
-        id: anomaly
-        continue-on-error: true
-        run: python scripts/check_anomalies.py
-
-      - name: Open issue on anomaly
-        if: steps.anomaly.outputs.anomaly == 'true'
-        run: |
-          gh issue create \
-            --title "Scraper anomaly $(date +'%Y-%m-%d')" \
-            --body "${{ steps.anomaly.outputs.report }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Push regenerated data to data repo
         run: |
           git clone https://x-access-token:${DATA_REPO_TOKEN}@github.com/Riley-Dorrington/job-board-data.git data-repo

@@ -18,7 +18,7 @@ Automated job board aggregating 1,000,000+ positions from 20,000+ companies acro
 - **URL state sync**: Filter/sort/page state persisted in the URL for shareable/bookmarkable searches
 - **Responsive design**: Desktop table view with card-based mobile layout
 - **Automated pipeline**: Daily GitHub Actions workflow: fetch existing data → scrape → merge → push chunks to the data repo → create release
-- **Trend tracking + anomaly detection**: Daily per-platform counts are appended to a trend log; a check flags any platform whose volume deviates sharply from its recent baseline and opens a GitHub issue
+- **Trend tracking**: Daily per-platform and per-tier counts are appended to a trend log
 - **Interactive heatmap**: Map view showing job density by location
 
 ![Map view with job density heatmap and filtering](docs/screenshot-map.png)
@@ -39,8 +39,7 @@ Automated job board aggregating 1,000,000+ positions from 20,000+ companies acro
 scripts/
 ├── scraper.py          # Multi-ATS scraper with parallel fetching
 ├── merge_data.py       # Deduplicates and prunes stale jobs (>30 days)
-├── geolocation.py      # Location lookup/enrichment for the heatmap
-└── check_anomalies.py  # Per-platform volume anomaly detection on the trend log
+└── geolocation.py      # Location lookup/enrichment for the heatmap
 
 js/
 ├── app.js              # Main app class and initialization
@@ -76,7 +75,7 @@ data/
 3. **Clean**: Jobs missing titles, URLs, or company info are dropped
 4. **Chunk**: Results are split into ~25k-job gzipped chunks with a manifest file
 5. **Merge**: `merge_data.py` deduplicates against existing data and prunes jobs older than 30 days
-6. **Monitor**: A daily trend snapshot (per-platform and per-tier counts) is appended to `data/trends/daily.jsonl` and committed to main. `check_anomalies.py` compares each platform against its recent baseline and opens an issue if one drops off or spikes abnormally.
+6. **Monitor**: A daily trend snapshot (per-platform and per-tier counts) is appended to `data/trends/daily.jsonl` and committed to main.
 7. **Deploy**: GitHub Actions force-pushes the regenerated chunks to the separate `job-board-data` [repo](https://github.com/Riley-Dorrington/job-board-data) and creates a tagged release on main. The frontend fetches chunks from the data repo's GitHub Pages site, keeping the main repo code-only.
 
 ## Company Discovery
