@@ -1,4 +1,4 @@
-import requests, threading, json, random, time, re, os, gzip, argparse, html
+import requests, threading, json, random, time, re, os, gzip, argparse, html, tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -770,33 +770,53 @@ def parse_workable_feed(stream):
 
 def fetch_workable_jobs():
     """Download and parse the Workable feed. On any failure returns no jobs,
-    never a partial feed; merge_data.py keeps the jobs of earlier runs."""
+    never a partial feed; merge_data.py keeps the jobs of earlier runs.
+
+    The feed is downloaded to a temporary file first and parsed afterwards.
+    Parsing straight from the socket ties the read speed to the parser, which
+    competes with every other platform's threads for the GIL. Every run from
+    2026-11-14 to 2026-11-17 lost the connection partway (IncompleteRead),
+    most likely because the server drops a reader that falls that far behind. The file is about 870 MB of XML on the runner's
+    disk, and is deleted when parsing ends."""
     print("=" * 80)
     print(f"FETCHING JOBS FROM PLATFORM: WORKABLE ({WORKABLE_FEED_URL})")
     print("=" * 80 + "\n")
+    received = 0
+    started = time.monotonic()
     try:
-        with requests.get(
-            WORKABLE_FEED_URL,
-            headers={"User-Agent": random.choice(USER_AGENTS)},
-            stream=True,
-            timeout=WORKABLE_TIMEOUT,
-            # The feed is served directly; a redirect is not the feed.
-            allow_redirects=False,
-        ) as response:
-            if response.status_code != 200:
-                retry = response.headers.get("Retry-After")
-                print(
-                    f"  Workable feed: HTTP {response.status_code}"
-                    + (f" (Retry-After: {retry}s)" if retry else "")
-                )
-                return {}, []
-            # Let urllib3 undo the gzip content encoding while streaming.
-            response.raw.decode_content = True
-            active_companies, jobs = parse_workable_feed(response.raw)
+        with tempfile.TemporaryFile() as feed:
+            with requests.get(
+                WORKABLE_FEED_URL,
+                headers={"User-Agent": random.choice(USER_AGENTS)},
+                stream=True,
+                timeout=WORKABLE_TIMEOUT,
+                # The feed is served directly; a redirect is not the feed.
+                allow_redirects=False,
+            ) as response:
+                if response.status_code != 200:
+                    retry = response.headers.get("Retry-After")
+                    print(
+                        f"  Workable feed: HTTP {response.status_code}"
+                        + (f" (Retry-After: {retry}s)" if retry else "")
+                    )
+                    return {}, []
+                # iter_content undoes the gzip content encoding.
+                for chunk in response.iter_content(chunk_size=1 << 20):
+                    feed.write(chunk)
+                    received += len(chunk)
+            print(
+                f"  Downloaded {received / 1e6:,.0f} MB of XML"
+                f" in {time.monotonic() - started:,.0f}s"
+            )
+            feed.seek(0)
+            active_companies, jobs = parse_workable_feed(feed)
     except Exception as e:
-        # Reading response.raw raises urllib3 errors, not requests ones, when the
-        # body is cut short; a ParseError means the XML ended early.
-        print(f"  Error fetching Workable feed: {e}")
+        # A body cut short raises a requests error from iter_content; a
+        # ParseError means the XML ended early.
+        print(
+            f"  Error fetching Workable feed after {received / 1e6:,.1f} MB"
+            f" and {time.monotonic() - started:,.0f}s: {e}"
+        )
         return {}, []
 
     print("\nDETAILED STATS FOR WORKABLE:")
