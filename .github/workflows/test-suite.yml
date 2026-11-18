@@ -21,4 +21,4 @@ jobs:
 
       - name: Run Job Tester
         run: |
-          python -m scripts.tests.test_suite.test_url
+          python scripts/tests/diag_workday.py
