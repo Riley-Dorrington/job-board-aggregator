@@ -432,6 +432,12 @@ def _parse_workday_posted_on(text):
     return None
 
 
+def _is_cloudflare_challenge(response):
+    """Cloudflare answers a bot check with a challenge page (HTTP 403 or 429,
+    'Cf-Mitigated: challenge'). Retrying it gets the same page."""
+    return response.headers.get("Cf-Mitigated", "").lower() == "challenge"
+
+
 def fetch_company_jobs_workday(slug):
     """
     slug format: "company|wd#|site_id" e.g. "kohls|wd1|kohlscareers"
@@ -480,6 +486,10 @@ def fetch_company_jobs_workday(slug):
             )
 
             if response.status_code != 200:
+                # Since 2026-11-16 Workday's Cloudflare challenges most requests
+                # from GitHub-hosted runners. Retrying only adds wait time.
+                if _is_cloudflare_challenge(response):
+                    return slug, normalized, "challenge"
                 if retries < max_retries:
                     retries += 1
                     time.sleep(random.uniform(2.0, 4.0))
@@ -1337,6 +1347,7 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
     all_jobs = []
     active_companies = {}
     failed = 0
+    challenged = 0
     new_dead = set()
 
     MAX_WORKERS = {
@@ -1358,6 +1369,8 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
 
             # fetcher returns slug, jobs, status_code (if implemented)
             slug, jobs, status_code = future.result()
+            if status_code == "challenge":
+                challenged += 1
 
             if jobs:
                 all_jobs.extend(jobs)
@@ -1382,6 +1395,8 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
     print(f"  Companies checked: {len(live_companies)}")
     print(f"  Companies with jobs: {len(active_companies)}")
     print(f"  Failed/empty: {failed}")
+    if challenged:
+        print(f"  Blocked by a Cloudflare bot challenge: {challenged:,}")
     print(f"  Newly dead: {len(new_dead)}")
     print(f"  Total jobs: {len(all_jobs)}")
 

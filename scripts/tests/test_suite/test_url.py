@@ -110,6 +110,10 @@ def collect_sample_urls(fetch_fn, slugs):
     return urls
  
  
+# Platforms whose samples were refused by a Cloudflare bot challenge.
+BLOCKED = set()
+
+
 def probe_workday(slug):
     """One raw request to a Workday sample, printing what came back, so an
     empty result shows whether Workday refused, changed its response, or
@@ -131,6 +135,10 @@ def probe_workday(slug):
         )
     except requests.RequestException as e:
         print(f"    probe {slug}: {e}")
+        return
+    if resp.headers.get("Cf-Mitigated", "").lower() == "challenge":
+        BLOCKED.add("Workday")
+        print(f"    probe {slug}: HTTP {resp.status_code}, Cloudflare bot challenge")
         return
     body = " ".join(resp.text[:300].split())
     print(
@@ -163,6 +171,8 @@ def url_resolves(url):
  
 def check_ats(name, fetch_fn, slugs):
     urls = collect_sample_urls(fetch_fn, slugs)
+    if not urls and name in BLOCKED:
+        return name, 0, 0, "BLOCKED"
     if not urls:
         # Extraction produced no URLs at all - parse path may have broken,
         # or every sample company is genuinely empty. Either way, flag it.
@@ -189,6 +199,8 @@ def diagnose(name, status):
         if name in CONSTRUCTED_URL_ATS:
             return "The built URL is likely stale (you construct this URL)"
         return "The provider API shape likely changed (URL is pass-through)"
+    if status == "BLOCKED":
+        return "Cloudflare bot challenge on this runner's IP, not a code problem"
     if status == "NO_URLS":
         return "Extraction returned nothing - parse path or all samples empty"
     return ""
@@ -206,7 +218,7 @@ def main():
             line += f"  ({note})"
         print(line)
         summary_lines.append(line)
-        if status in ("PATTERN_BROKEN", "NO_URLS"):
+        if status in ("PATTERN_BROKEN", "NO_URLS", "BLOCKED"):
             failures.append(name)
  
     if summary_path:
